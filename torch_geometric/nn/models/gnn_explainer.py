@@ -132,7 +132,60 @@ class GNNExplainer(torch.nn.Module):
 
         return loss
 
-    def explain_node(self, node_idx, x, edge_index, **kwargs):
+    def __loss_graph__(self, log_logits, pred_label):
+        loss = -log_logits[pred_label] 
+
+        m = self.edge_mask.sigmoid()
+        edge_reduce = getattr(torch, self.coeffs['edge_reduction'])
+        loss = loss + self.coeffs['edge_size'] * edge_reduce(m)
+        ent = -m * torch.log(m + EPS) - (1 - m) * torch.log(1 - m + EPS)
+        loss = loss + self.coeffs['edge_ent'] * ent.mean()
+        return loss
+
+    def explain_graph(self, data):
+        self.model.eval()
+        self.__clear_masks__()
+
+        num_edges = data.edge_index.size(1)
+
+        # Get the initial prediction.
+        with torch.no_grad():
+            log_logits = self.model(data)
+            log_logits = [torch.log(1-torch.sigmoid(log_logits[0,0])),torch.log(torch.sigmoid(log_logits[0,0]))]  # only considers the first task, and it is a binary classification task. If < 0, the prediction is negative.
+            pred_label = torch.argmax(torch.tensor(log_logits))
+
+        self.__set_masks__(data.x, data.edge_index)
+        self.to(data.x.device)
+
+        optimizer = torch.optim.Adam([self.edge_mask],
+                                     lr=self.lr)
+
+        if self.log:  # pragma: no cover
+            pbar = tqdm(total=self.epochs)
+            pbar.set_description(f'Explain node {node_idx}')
+
+        for epoch in range(1, self.epochs + 1):
+            optimizer.zero_grad()
+            log_logits = self.model(data, **kwargs)
+            log_logits = [torch.log(1-torch.sigmoid(log_logits[0,0])),torch.log(torch.sigmoid(log_logits[0,0]))]  # only considers the first task, and it is a binary classification task. If < 0, the prediction is negative.
+            log_logits = torch.tensor(log_logits)
+            loss = self.__loss_graph__(log_logits, pred_label)
+            loss.backward()
+            optimizer.step()
+
+            if self.log:  # pragma: no cover
+                pbar.update(1)
+
+        if self.log:  # pragma: no cover
+            pbar.close()
+
+        edge_mask = self.edge_mask.detach().sigmoid()#self.edge_mask.new_zeros(num_edges)
+
+        self.__clear_masks__()
+
+        return edge_mask
+    
+    def explain_node(self, node_idx, data, **kwargs):
         r"""Learns and returns a node feature mask and an edge mask that play a
         crucial role to explain the prediction made by the GNN for node
         :attr:`node_idx`.
